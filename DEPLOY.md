@@ -13,16 +13,16 @@ git branch -M main && git remote add origin https://github.com/<you>/<repo>.git 
 
 ## One-time GCP setup (replace PROJECT_ID; region asia-south1 is the default in cloudbuild.yaml)
 ```bash
-gcloud config set project PROJECT_ID
+gcloud config set project phrasal-fire-373510
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
 
 gcloud artifacts repositories create dashboards --repository-format=docker --location=asia-south1
 
 # runtime service account
 gcloud iam service-accounts create dashboard-runner
-SA=dashboard-runner@PROJECT_ID.iam.gserviceaccount.com
-gcloud projects add-iam-policy-binding PROJECT_ID --member=serviceAccount:$SA --role=roles/bigquery.jobUser
-gcloud projects add-iam-policy-binding PROJECT_ID --member=serviceAccount:$SA --role=roles/bigquery.dataViewer
+SA=dashboard-runner@phrasal-fire-373510.iam.gserviceaccount.com
+gcloud projects add-iam-policy-binding phrasal-fire-373510 --member=serviceAccount:$SA --role=roles/bigquery.jobUser
+gcloud projects add-iam-policy-binding phrasal-fire-373510 --member=serviceAccount:$SA --role=roles/bigquery.dataViewer
 gsutil iam ch serviceAccount:$SA:objectAdmin gs://bba_access_token      # reads AND writes token files
 gsutil iam ch serviceAccount:$SA:objectViewer gs://bba_support_files
 
@@ -31,10 +31,10 @@ gcloud secrets create dashboard-env --data-file=.env
 gcloud secrets add-iam-policy-binding dashboard-env --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor
 
 # Cloud Build's service account needs to deploy and act as the runtime SA
-PN=$(gcloud projects describe PROJECT_ID --format='value(projectNumber)')
+PN=$(gcloud projects describe phrasal-fire-373510 --format='value(projectNumber)')
 CB=$PN@cloudbuild.gserviceaccount.com      # or the trigger's own service account if you chose one
 for R in roles/run.admin roles/artifactregistry.writer roles/logging.logWriter; do
-  gcloud projects add-iam-policy-binding PROJECT_ID --member=serviceAccount:$CB --role=$R; done
+  gcloud projects add-iam-policy-binding phrasal-fire-373510 --member=serviceAccount:$CB --role=$R; done
 gcloud iam service-accounts add-iam-policy-binding $SA --member=serviceAccount:$CB --role=roles/iam.serviceAccountUser
 ```
 Update the secret later with `gcloud secrets versions add dashboard-env --data-file=.env` (redeploy to pick it up).
