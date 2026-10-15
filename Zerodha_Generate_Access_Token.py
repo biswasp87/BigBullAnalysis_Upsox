@@ -18,11 +18,11 @@ def broker_login():
     Kite Object, in case the login was successful
     None, if the login fails
     """
-    user_id = 'FU7350'
-    password = 'Arch.0303'
-    totp_key = 'URQTZPLXSEI74C7BLN2PFRBXGNE244FT'
-    api_key = 'njg16v6xxfb7iorf'
-    app_secret = '3qb9gltdtx6fqv727ibzeks3zfiyqxb6'
+    user_id = os.environ['ZERODHA_USER_ID']
+    password = os.environ['ZERODHA_PASSWORD']
+    totp_key = os.environ['ZERODHA_TOTP_KEY']
+    api_key = os.environ['ZERODHA_API_KEY']
+    app_secret = os.environ['ZERODHA_APP_SECRET']
     # Download Broker Login credentials from Broker app config file
     session = requests.Session()
     login_payload = {

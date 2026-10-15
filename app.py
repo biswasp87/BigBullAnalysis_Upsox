@@ -9,7 +9,6 @@ import dash
 from dash import dcc, html, Input, Output, State, dash_table
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
-from pandas.core.common import not_none
 from plotly.subplots import make_subplots
 import numpy as np
 import json
@@ -19,6 +18,12 @@ import time
 from dash import dash_table as dt
 from google.cloud import bigquery
 import re
+
+try:                                   # optional: load secrets from a .env file (local runs / Secret Manager mount)
+    from dotenv import load_dotenv
+    load_dotenv(os.environ.get("ENV_FILE", ".env"))
+except ImportError:
+    pass
 
 
 # if os.path.exists(f"AccessToken/{datetime.datetime.now().date()}.json"):
@@ -76,8 +81,7 @@ DEFAULT_TOKEN = get_token_from_gcs("bba_access_token")
 # _____________________________________________________________________________________
 # Zerodha Kite Connect Alert Configurations
 # _____________________________________________________________________________________
-KITE_API_KEY = "njg16v6xxfb7iorf"
-# KITE_ACCESS_TOKEN = "8x31Qizca4yF0xlfIbJPUjkdhO307LIU"
+KITE_API_KEY = os.environ.get("KITE_API_KEY", "")
 KITE_ACCESS_TOKEN = get_zerodha_token_from_gcs("bba_access_token")
 
 KITE_ALERTS_URL = "https://api.kite.trade/alerts"
@@ -130,10 +134,48 @@ watchlist = pd.read_csv("gs://bba_support_files/WL_ALL.csv")
 dropdown_opt_list = pd.read_csv("gs://bba_support_files/Dropdown_options.csv")
 Expiry_Date_Monthly = pd.read_csv("gs://bba_support_files/stock_expiry_dates.csv")
 
-try:
-    Local_Equity_Data = pd.read_csv("Master_Equity_Data.csv")
-except Exception as e:
-    print(e)
+# --- Local data files (data source 'Local CSV'): picked from a dropdown while the app runs; NOTHING is read at start-up ---
+LOCAL_DATA_DIR = os.getcwd()                  # folder that is scanned for data files - change it if your files live elsewhere
+LOCAL_DATA_EXT = (".csv", ".xlsx", ".xls")
+LOCAL_DATA_DEFAULT = "Master_Equity_Data.csv"   # pre-selected in the dropdown when it exists in the folder
+_LOCAL_DATA_CACHE = {}                        # path -> (modified time, DataFrame); re-read automatically when the file changes
+
+
+def list_local_data_files():
+    """Dropdown options: every csv / excel file in LOCAL_DATA_DIR."""
+    try:
+        names = sorted((f for f in os.listdir(LOCAL_DATA_DIR)
+                        if f.lower().endswith(LOCAL_DATA_EXT) and not f.startswith("~$")), key=str.lower)
+    except Exception as e:
+        print(f"Cannot list {LOCAL_DATA_DIR}: {e}")
+        names = []
+    return [{"label": n, "value": n} for n in names]
+
+
+def default_local_file(options):
+    names = [o["value"] for o in options]
+    return LOCAL_DATA_DEFAULT if LOCAL_DATA_DEFAULT in names else None
+
+
+def load_local_equity_data(file_name):
+    """Read the chosen file on demand (cached; re-read when it changes on disk). Returns None if it cannot be read."""
+    if not file_name:
+        return None
+    path = os.path.join(LOCAL_DATA_DIR, os.path.basename(file_name))      # basename: never leave the folder
+    try:
+        mtime = os.path.getmtime(path)
+        cached = _LOCAL_DATA_CACHE.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        df = pd.read_excel(path) if path.lower().endswith((".xlsx", ".xls")) else pd.read_csv(path)
+        if len(_LOCAL_DATA_CACHE) >= 3:
+            _LOCAL_DATA_CACHE.pop(next(iter(_LOCAL_DATA_CACHE)))
+        _LOCAL_DATA_CACHE[path] = (mtime, df)
+        return df
+    except Exception as e:
+        print(f"❌ Could not load local data file {file_name}: {e}")
+        return None
+
 
 # Global instances to optimize execution speed
 bq_client = bigquery.Client()
@@ -418,6 +460,7 @@ def _rh_group(label, key):
 
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
+server = app.server                           # gunicorn entry point:  gunicorn app:server
 
 # =====================================================================
 # POP-OUT WINDOWS for the Trend Analytics graphs (drag the window to a second monitor).
@@ -666,6 +709,19 @@ app.layout = dbc.Container([
 # --- DYNAMIC INTERFACE ELEMENT DECLARATIONS FOR USE IN CALLBACK ---
 # Separate the core functional chunks so they can be easily moved around based on state
 
+def build_sr_control():
+    """Support / Resistance lines = pivot points (P, R1, S1) of the previous completed Day / Week / Month.
+    Multi-select; drawn on the price chart by update_graph_31."""
+    return html.Div([
+        html.Span("S/R", className="fw-bold small me-2", style={"cursor": "help"},
+                  title="Support & Resistance = pivot points (P, R1, S1) of the previous Day / Week / Month"),
+        dbc.Checklist(id="sr-levels-select", inline=True, switch=True, value=[], className="mb-0",
+                      style={"fontSize": "0.72rem"},
+                      options=[{"label": "Daily", "value": "D"}, {"label": "Weekly", "value": "W"},
+                               {"label": "Monthly", "value": "M"}]),
+    ], className="d-flex align-items-center")
+
+
 equity_hub_card = dbc.Card([
     dbc.CardHeader(
         dbc.Row([
@@ -723,6 +779,7 @@ equity_hub_card = dbc.Card([
     dbc.CardBody([
         dbc.Tabs([
             dbc.Tab(label="Stock Analysis", tab_id="tab-stock-analysis", children=[
+                html.Div(build_sr_control(), className="px-2 pt-1"),
                 dcc.Graph(id='graph_31', config=dict({'scrollZoom': True}),
                           style={"height": "60vh", "minHeight": "400px"})],
                     label_style={"border": "none", "background": "transparent", "color": "#6c757d"},
@@ -846,22 +903,38 @@ def _settings_items():
     return [
         _access_tokens_item(),
         dbc.AccordionItem([
+            html.H6("Moving average lines (on the price chart)", className="small text-muted"),
+            dbc.Checklist(id="ma-lines-select", inline=True, switch=True, className="mb-1", style={"fontSize": "0.85rem"},
+                          options=[{"label": "MA 1", "value": "short"}, {"label": "MA 2", "value": "medium"},
+                                   {"label": "MA 3", "value": "long"}],
+                          value=["short", "medium"]),
             dbc.Row([
-                dbc.Col([html.Label("Short", className="small text-muted mb-1"),
-                         dcc.Input(id="input_short_SMA", type="number", min=1, max=200, step=1, value=2,
+                dbc.Col([html.Label("MA 1 period", className="small text-muted mb-1"),
+                         dcc.Input(id="input_short_SMA", type="number", min=1, max=400, step=1, value=5,
                                    className="form-control form-control-sm")], xs=4),
-                dbc.Col([html.Label("Medium", className="small text-muted mb-1"),
-                         dcc.Input(id="input_medium_SMA", type="number", min=1, max=200, step=1, value=7,
+                dbc.Col([html.Label("MA 2 period", className="small text-muted mb-1"),
+                         dcc.Input(id="input_medium_SMA", type="number", min=1, max=400, step=1, value=20,
                                    className="form-control form-control-sm")], xs=4),
-                dbc.Col([html.Label("Long", className="small text-muted mb-1"),
-                         dcc.Input(id="input_long_SMA", type="number", min=1, max=200, step=1, value=21,
+                dbc.Col([html.Label("MA 3 period", className="small text-muted mb-1"),
+                         dcc.Input(id="input_long_SMA", type="number", min=1, max=400, step=1, value=50,
                                    className="form-control form-control-sm")], xs=4),
             ], className="mb-3 g-2"),
             html.H6("Select Resolution", className="small text-muted"),
             dcc.RangeSlider(id='my-range-slider', min=400, max=800, step=50, value=[800], marks=None, className="mb-3"),
+            html.H6("Data source", className="small text-muted"),
             dbc.Row([dcc.RadioItems(id="data_source_select", options=[{"label": " BigQuery ", "value": "bq"},
                                                                       {"label": " Local CSV ", "value": "local"}],
                                     value="bq", inline=True, labelStyle={'marginRight': '15px'})]),
+            html.Div([
+                dcc.Dropdown(id="local-data-file", options=list_local_data_files(),
+                             value=default_local_file(list_local_data_files()), clearable=False, disabled=True,
+                             placeholder="Select a local data file (csv / xlsx)",
+                             style={"fontSize": "0.8rem", "flex": "1 1 auto", "minWidth": 0}),
+                dbc.Button("↻", id="btn-local-refresh", size="sm", color="secondary", outline=True, className="ms-1",
+                           title="Rescan the folder and re-read the selected file"),
+            ], className="d-flex align-items-center mt-2"),
+            html.Div(f"Folder: {LOCAL_DATA_DIR}", id="local-data-status", className="small text-muted mt-1",
+                     style={"wordBreak": "break-all"}),
         ], title="Chart Settings"),
         dbc.AccordionItem([
             dbc.Button("Save Table to GCS", id="btn-save-shortlist-gcs", color="success", size="sm",
@@ -1239,7 +1312,8 @@ def build_compact_layout():
     # ---------- ROW 1 : Stock Analysis 60% (full screen height) | Options card 40% ----------
     stock = _panel("Stock Analysis",
                    dcc.Graph(id='graph_31', config={'scrollZoom': True}, style={'height': _h('r1', 12)}), 'r1',
-                   right=build_stream_controls())
+                   right=html.Div([build_sr_control(), build_stream_controls()],
+                                  className="d-flex align-items-center gap-3"))
     row1 = dbc.Row([_col(stock, 60), _col(build_right_panel(), 40)], className="g-0 mb-1 flex-nowrap")
 
     # ---------- ROW 2 (below the fold) : Trend Analytics Workspace, full width ----------
@@ -1426,6 +1500,24 @@ def generate_access_token(n_upstox, n_zerodha):
                      color="success", className="py-1 px-2 mb-0"), time.time()
 
 
+# ---- Local data dropdown: enabled only for the 'Local CSV' source; the refresh button rescans the folder ----
+@app.callback(Output("local-data-file", "disabled"), Input("data_source_select", "value"))
+def toggle_local_file_dropdown(source):
+    return source != "local"
+
+
+@app.callback(
+    [Output("local-data-file", "options"), Output("local-data-status", "children")],
+    [Input("btn-local-refresh", "n_clicks")],
+    prevent_initial_call=True
+)
+def refresh_local_files(n_clicks):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    options = list_local_data_files()
+    return options, f"Folder: {LOCAL_DATA_DIR}  ({len(options)} file(s) found)"
+
+
 # --- NEW CALLBACK TO DYNAMICALLY CHANGE LAYOUT FACTORING LANDSCAPE VS PORTRAIT MODE ---
 @app.callback(
     Output("dynamic-content-layout", "children"),
@@ -1540,7 +1632,7 @@ def update_and_navigate_symbols(scanner_val, shortlist_data, prev_clicks, next_c
     new_symbol = current_symbol if current_symbol in valid_symbols else valid_symbols[0]
 
     # Handle Next/Prev button clicks
-    if triggered_id in ['prev-btn', 'next-btn']:
+    if (triggered_id == 'prev-btn' and prev_clicks) or (triggered_id == 'next-btn' and next_clicks):
         idx = valid_symbols.index(new_symbol)
         if triggered_id == 'next-btn':
             new_symbol = valid_symbols[(idx + 1) % len(valid_symbols)]
@@ -2124,9 +2216,9 @@ def update_interval_settings(inc, dec, current_val):
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
     new_val = current_val if current_val is not None else 3
 
-    if triggered_id == 'interval-inc-btn':
+    if triggered_id == 'interval-inc-btn' and inc:
         new_val += 1
-    elif triggered_id == 'interval-dec-btn':
+    elif triggered_id == 'interval-dec-btn' and dec:
         new_val = max(1, new_val - 1)
 
     return new_val, new_val * 1000
@@ -2146,13 +2238,31 @@ def toggle_streaming(start_clicks, start_rec_clicks, stop_clicks, currently_disa
         return currently_disabled, currently_recording
 
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    if button_id == 'start-stream-btn':
+    # act only on a REAL click (n_clicks > 0); a freshly created button reports n_clicks=None and must not start anything
+    if button_id == 'start-stream-btn' and start_clicks:
         return False, False
-    elif button_id == 'start-recording-btn':
+    elif button_id == 'start-recording-btn' and start_rec_clicks:
         return False, True
-    elif button_id == 'stop-stream-btn':
+    elif button_id == 'stop-stream-btn' and stop_clicks:
         return True, False
     return currently_disabled, currently_recording
+
+
+@app.callback(
+    Output('stream-qty-store', 'data', allow_duplicate=True),
+    [Input('option-chain-store', 'data')],
+    [State('stream-interval', 'disabled'), State('underlying-info-store', 'data')],
+    prevent_initial_call=True
+)
+def snapshot_quotes_when_not_streaming(chain_data, stream_disabled, underlying_info):
+    """App load / stock change / expiry change while NOT streaming: fetch the buy-sell quantities once, so the table,
+    strike markers and equity triangle are filled. While streaming, the interval callback below does the fetching."""
+    if not stream_disabled or not chain_data or not underlying_info:
+        raise dash.exceptions.PreventUpdate
+    rows, _ = update_streaming_data(None, None, None, None, chain_data, underlying_info, False, [])
+    if rows is dash.no_update:
+        raise dash.exceptions.PreventUpdate
+    return rows
 
 
 @app.callback(
@@ -2604,6 +2714,92 @@ def _add_option_chain_overlay(fig, df_stock, chain_data, underlying_info, stream
 
 
 # _____________________________________________________________________________________
+# SUPPORT / RESISTANCE LINES  = classic pivot points (P, R1, S1) of the previous Day / Week / Month
+# _____________________________________________________________________________________
+PIVOT_LEVELS = ("R1", "P", "S1")      # levels drawn; any of "R3", "R2", "R1", "P", "S1", "S2", "S3" can be added here
+# per timeframe: (line dash, width, {level kind: colour}) - colour = kind (R red / P blue / S green), weight = timeframe
+SR_STYLES = {
+    "D": ("dot",   1.3, {"R": "#ef9a9a", "P": "#90a4ae", "S": "#81c784"}),
+    "W": ("dash",  1.7, {"R": "#e53935", "P": "#1e88e5", "S": "#43a047"}),
+    "M": ("solid", 2.3, {"R": "#8e0000", "P": "#0d47a1", "S": "#0b5d1e"}),
+}
+_SR_FREQ = {"D": "D", "W": "W", "M": "M"}
+
+
+def _sr_levels(df_full, tf):
+    """Classic (floor-trader) pivot points of the previous COMPLETED day / week (Mon-Sun) / calendar month, for every
+    candle plus one extra row for the NEXT session:
+        P = (H + L + C) / 3      R1 = 2P - L      S1 = 2P - H
+        R2 = P + (H - L)         S2 = P - (H - L)
+        R3 = H + 2(P - L)        S3 = L - 2(H - P)
+    H / L / C = high / low / close of that previous period. Computed on the full history, so the first visible candle
+    already has its levels. Returns a DataFrame [TIMESTAMP, P, R1, S1, R2, S2, R3, S3] (last row = level now in force)."""
+    d = df_full[["TIMESTAMP", "EQ_HIGH_PRICE", "EQ_LOW_PRICE", "EQ_CLOSE_PRICE"]].dropna()
+    if d.empty:
+        return None
+    freq = _SR_FREQ[tf]
+    nxt = d["TIMESTAMP"].iloc[-1] + pd.offsets.BDay(1)
+    dates = pd.concat([d["TIMESTAMP"], pd.Series([nxt])], ignore_index=True)
+    agg = d.groupby(d["TIMESTAMP"].dt.to_period(freq)).agg(
+        H=("EQ_HIGH_PRICE", "max"), L=("EQ_LOW_PRICE", "min"), C=("EQ_CLOSE_PRICE", "last"))
+    h, l, c = (agg[k].to_numpy(dtype=float) for k in ("H", "L", "C"))
+    p = (h + l + c) / 3.0
+    by_period = {"P": p, "R1": 2 * p - l, "S1": 2 * p - h, "R2": p + (h - l), "S2": p - (h - l),
+                 "R3": h + 2 * (p - l), "S3": l - 2 * (h - p)}
+    pos = agg.index.searchsorted(pd.PeriodIndex(dates, freq=freq)) - 1      # last period strictly before each date
+    ok = pos >= 0
+    take = np.clip(pos, 0, None)
+    out = {"TIMESTAMP": dates}
+    for name, arr in by_period.items():
+        out[name] = np.where(ok, arr[take], np.nan)
+    return pd.DataFrame(out)
+
+
+def _draw_sr_levels(fig, df_stock, sr_full, chain_data):
+    """Pivot levels as step lines on the price chart (row 1): a level is held through its period; each line is labelled
+    with the level in force for the next session, e.g. 'W-R1 1,234.5' (D = daily, W = weekly, M = monthly)."""
+    if not sr_full:
+        return
+    x0, x1 = df_stock['TIMESTAMP'].iloc[0], df_stock['TIMESTAMP'].iloc[-1]
+    x_end = None
+    if OI_PROFILE_ENABLED and chain_data:        # run the lines on into the strip reserved for the OI profile
+        x_end = x1 + (x1 - x0) * (OI_PROFILE_WIDTH / (1 - OI_PROFILE_WIDTH)) * 1.08
+    for tf in ("D", "W", "M"):
+        lv = sr_full.get(tf)
+        if lv is None or lv.empty:
+            continue
+        lv = lv[lv["TIMESTAMP"] >= x0].reset_index(drop=True)
+        if lv.empty:
+            continue
+        nxt = lv["TIMESTAMP"].iloc[-1]
+        dash, width, colours = SR_STYLES[tf]
+        line_df = lv
+        if x_end is not None and x_end > nxt:
+            line_df = pd.concat([lv, lv.iloc[[-1]].assign(TIMESTAMP=x_end)], ignore_index=True)
+        for level in PIVOT_LEVELS:
+            if level not in lv.columns:
+                continue
+            name, colour = f"{tf}-{level}", colours[level[0]]
+            fig.add_trace(go.Scatter(x=line_df["TIMESTAMP"], y=line_df[level], mode="lines", name=name,
+                                     line=dict(color=colour, width=width, dash=dash, shape="hv"), showlegend=False,
+                                     hovertemplate=name + " %{y:,.2f}<extra></extra>"), row=1, col=1)
+            last = lv[level].iloc[-1]
+            if pd.notna(last):
+                fig.add_trace(go.Scatter(x=[nxt], y=[last], mode="text", text=[f"{name} {last:,.1f}"],
+                                         textposition="top left", textfont=dict(size=9, color=colour),
+                                         showlegend=False, hoverinfo="skip"), row=1, col=1)
+
+
+def _empty_fig(message):
+    fig = go.Figure()
+    fig.add_annotation(text=message, showarrow=False, xref="paper", yref="paper", x=0.5, y=0.5,
+                       font=dict(size=14, color="#888"))
+    fig.update_layout(xaxis=dict(visible=False), yaxis=dict(visible=False), plot_bgcolor="white",
+                      paper_bgcolor="white", margin=dict(l=10, r=10, t=10, b=10))
+    return fig
+
+
+# _____________________________________________________________________________________
 # DISPLAY Graph
 # _____________________________________________________________________________________
 @app.callback(
@@ -2618,11 +2814,17 @@ def _add_option_chain_overlay(fig, df_stock, chain_data, underlying_info, stream
      Input('my-range-slider', 'value'),
      Input('option-chain-store', 'data'),            # live chain -> OI profile on the price chart
      Input('stream-qty-store', 'data'),              # live buy/sell quantities -> markers
+     Input('ma-lines-select', 'value'),              # which moving-average lines are shown
+     Input('sr-levels-select', 'value'),             # support / resistance: D / W / M (multi-select)
+     Input('local-data-file', 'value'),              # file used when the data source is 'Local CSV'
+     Input('btn-local-refresh', 'n_clicks'),         # re-read that file now
      ],
     [State('underlying-info-store', 'data')])
 def update_graph_31(data_source, dropdown_exp_value, dropdown_value, dropdown_n_days_value,
                     short_sma, medium_sma, long_sma, graph_height, chain_data=None, stream_rows=None,
-                    underlying_info=None):
+                    ma_lines=None, sr_levels=None, local_file=None, local_refresh=None, underlying_info=None):
+    if not dropdown_exp_value or not dropdown_value:
+        raise dash.exceptions.PreventUpdate
     expiry_date = datetime.datetime.strptime(dropdown_exp_value, "%Y-%m-%d").date()
     if data_source == "bq":
         if dropdown_value in STOCK_DATA_CACHE:
@@ -2651,11 +2853,26 @@ def update_graph_31(data_source, dropdown_exp_value, dropdown_value, dropdown_n_
     else:
         # Import Data from Local Machine
         # _______________________________________________________________________________________________________________
-        df_stock = Local_Equity_Data[Local_Equity_Data['SYMBOL'] == dropdown_value].copy()
+        if 'btn-local-refresh' in str(dash.callback_context.triggered):
+            _LOCAL_DATA_CACHE.clear()              # refresh button: force a re-read from disk
+        local_df = load_local_equity_data(local_file)
+        if local_df is None or 'SYMBOL' not in local_df.columns:
+            return _empty_fig("Local CSV: choose a data file in  ⚙ Settings ▸ Chart Settings ▸ Data source")
+        df_stock = local_df[local_df['SYMBOL'] == dropdown_value].copy()
+        if df_stock.empty:
+            return _empty_fig(f"{dropdown_value} is not in {local_file}")
 
     df_stock.style.format({"TIMESTAMP": lambda t: t.strftime("%Y-%m-%d")})
     df_stock['TIMESTAMP'] = pd.to_datetime(df_stock['TIMESTAMP'], dayfirst=True, format='mixed')
     df_stock = df_stock.sort_values(by='TIMESTAMP', ascending=True)
+
+    # Moving averages and support / resistance levels use the FULL history (before the 'Days' slice), so the lines
+    # already start at the first visible candle.
+    ma_periods = {k: max(1, int(p or d_)) for k, p, d_ in
+                  (("short", short_sma, 5), ("medium", medium_sma, 20), ("long", long_sma, 50))}
+    for _k, _p in ma_periods.items():
+        df_stock[f"MA_{_k}"] = df_stock["EQ_CLOSE_PRICE"].rolling(_p).mean()
+    sr_full = {_tf: _sr_levels(df_stock, _tf) for _tf in (sr_levels or []) if _tf in SR_STYLES}
 
     # In-memory slice based on user choice (extremely fast)
     df_stock = df_stock.tail(dropdown_n_days_value)
@@ -2741,12 +2958,12 @@ def update_graph_31(data_source, dropdown_exp_value, dropdown_value, dropdown_n_
             go.Scatter(x=df_10M_VOL['TIMESTAMP'], y=df_10M_VOL['CUR_PE_STRIKE_PR_10MVOL'], mode='markers',
                        marker=dict(size=10, symbol=6, color='red'), name='PE Buildup'),
             row=1, col=1)
-    # Add 5 SMA to Closing Price in OHCL Plot
-    fig.add_trace(go.Scatter(x=df_stock['TIMESTAMP'], y=df_stock.EQ_CLOSE_PRICE.rolling(5).mean(), name='5SMA Close'),
-                  row=1, col=1)
-    # Add 20 SMA to Closing Price in OHCL Plot
-    fig.add_trace(go.Scatter(x=df_stock['TIMESTAMP'], y=df_stock.EQ_CLOSE_PRICE.rolling(20).mean(), name='20SMA Close'),
-                  row=1, col=1)
+    # Moving-average lines (shown / hidden and sized in Chart Settings)
+    for _k, _colour, _w in (("short", '#1f77b4', 1.2), ("medium", '#ff7f0e', 1.6), ("long", '#9467bd', 2.0)):
+        if _k in (ma_lines or []):
+            fig.add_trace(go.Scatter(x=df_stock['TIMESTAMP'], y=df_stock[f"MA_{_k}"], mode='lines',
+                                     line=dict(color=_colour, width=_w), name=f"{ma_periods[_k]} SMA Close",
+                                     hovertemplate=f"{ma_periods[_k]} SMA %{{y:,.2f}}<extra></extra>"), row=1, col=1)
     # Add ENTRY Lines.....................
     fig.add_trace(
         go.Scatter(x=df_10M_VOL['TIMESTAMP'], y=df_10M_VOL['ENTRY_BO'], mode='lines', name='Entry',
@@ -2757,6 +2974,8 @@ def update_graph_31(data_source, dropdown_exp_value, dropdown_value, dropdown_n_
         go.Scatter(x=df_10M_VOL['TIMESTAMP'], y=df_10M_VOL['ENTRY_BD'], mode='lines', name='SL',
                    line=dict(color='black')),
         row=1, col=1)
+    # Support / Resistance = pivot points (P, R1, S1) of the previous Day / Week / Month, selected in the chart header
+    _draw_sr_levels(fig, df_stock, sr_full, chain_data)
     # Add Volume as Subplot
     fig.add_trace(
         go.Bar(x=df_stock['TIMESTAMP'], y=df_stock['EQ_TTL_TRD_QNTY'], name='Volume', offsetgroup=1),
@@ -2925,12 +3144,17 @@ def toggle_shortlist_modal(open_clicks, close_clicks, save_clicks, is_open, curr
 
     trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
 
-    # Only open the modal if the open button was clicked
+    # Only open the modal if the open button was really clicked (not merely created by the layout)
     if trigger_id == "btn-open-shortlist-modal":
-        return True, current_symbol, ""
+        if open_clicks:
+            return True, current_symbol, ""
+        return is_open, dash.no_update, dash.no_update
 
-    # Close it otherwise (Save or Cancel was clicked)
-    return False, dash.no_update, ""
+    # Close it only when Save or Cancel was really clicked
+    if (trigger_id == "btn-close-shortlist-modal" and close_clicks) or \
+            (trigger_id == "btn-save-shortlist-modal" and save_clicks):
+        return False, dash.no_update, ""
+    return is_open, dash.no_update, dash.no_update
 
 
 # 2. Append New Symbol to the Table
@@ -3075,6 +3299,12 @@ def handle_alert_modal_actions(create_clicks, modify_clicks, cancel_clicks, subm
     # Default return state (keeps UI exactly as it currently is)
     ret = [is_open, "", edit_uuid, name, exchange, symbol, attribute, operator, val, alert_type, ato_basket,
            selected_rows]
+
+    # ignore "triggers" that are not real clicks (a button re-created by the layout has n_clicks=None)
+    _clicks = {"btn-create-alert": create_clicks, "btn-modify-alert": modify_clicks,
+               "btn-cancel-alert": cancel_clicks, "btn-submit-alert": submit_clicks}
+    if not _clicks.get(trigger_id):
+        return ret
 
     if trigger_id == "btn-create-alert":
         # Extract symbol and underlying price from the store
@@ -3248,4 +3478,4 @@ def filter_trading_symbol_options(search_value):
 
 
 if __name__ == "__main__":
-    app.run_server(debug=False, host="0.0.0.0", port=8080)
+    app.run_server(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.env.*
+AccessToken/
+__pycache__/
+*.pyc
+*.csv
+*.xlsx
+DEPLOY.md
+cloudbuild.yaml

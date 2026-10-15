@@ -1,0 +1,45 @@
+# Build -> push to Artifact Registry -> deploy to Cloud Run.
+# Works for GitHub triggers and manual `gcloud builds submit` ($BUILD_ID is always set; $SHORT_SHA is not for manual builds).
+substitutions:
+  _REGION: asia-south1
+  _AR_REPO: dashboards
+  _SERVICE: upstox-dashboard
+  _RUN_SA: dashboard-runner@${PROJECT_ID}.iam.gserviceaccount.com
+  _SECRET: dashboard-env
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ['build', '-t', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE}:${BUILD_ID}',
+           '-t', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE}:latest', '.']
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE}']
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE}:${BUILD_ID}
+      - --region=${_REGION}
+      - --service-account=${_RUN_SA}
+      - --no-allow-unauthenticated        # the app can create broker tokens / alerts - never make it public
+      - --memory=2Gi
+      - --cpu=1
+      - --min-instances=1                  # keep in-memory stream state alive between requests
+      - --max-instances=1                  # state is in memory -> single instance
+      - --timeout=300
+      - --concurrency=40
+      - --set-env-vars=ENV_FILE=/secrets/dashboard.env
+      - --set-secrets=/secrets/dashboard.env=${_SECRET}:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE}:${BUILD_ID}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_SERVICE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
